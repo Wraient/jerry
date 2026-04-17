@@ -45,7 +45,7 @@ dep_ch() {
         command -v "$dep" >/dev/null || send_notification "Program \"$dep\" not found. Please install it."
     done
 }
-dep_ch "grep" "$sed" "curl" "fzf" || true
+dep_ch "grep" "$sed" "curl" "fzf" "openssl" || true
 
 if [ "$use_external_menu" = true ]; then
     dep_ch "rofi" || true
@@ -159,6 +159,22 @@ https://anilist.co/api/v2/oauth/authorize?client_id=9857&response_type=token : "
 #### SCRAPING FUNCTIONS ####
 ## ALLANIME ##
 # this has been adapted from ani-cli
+
+decode_tobeparsed() {
+    blob="$1"
+    tmp="$(mktemp)"
+    ct="$(mktemp)"
+    key="$(printf '%s' 'SimtVuagFbGR2K7P' | openssl dgst -sha256 -binary | od -A n -t x1 | tr -d ' \n')"
+    printf '%s' "$blob" | openssl enc -d -base64 -A >"$tmp"
+    len="$(wc -c <"$tmp" | tr -d ' ')"
+    iv="$(dd if="$tmp" bs=1 count=12 2>/dev/null | od -A n -t x1 | tr -d ' \n')"
+    ct_len=$((len - 28))
+    dd if="$tmp" bs=1 skip=12 count="$ct_len" 2>/dev/null >"$ct"
+    ctr="${iv}00000002"
+    plain="$(openssl enc -d -aes-256-ctr -K "$key" -iv "$ctr" -nosalt -nopad <"$ct" 2>/dev/null)"
+    rm -f "$tmp" "$ct"
+    printf '%s' "$plain" | tr '{}' '\n' | sed -nE 's|.*"sourceUrl":"--([^"]*)".*"sourceName":"([^"]*)".*|\2 :\1|p'
+}
 
 # extract the video links from reponse of embed urls, extract mp4 links form m3u8 lists
 get_links() {
@@ -859,7 +875,8 @@ get_episode_info() {
     case "$provider" in
         allanime)
             query_title=$(printf "%s" "$title" | tr ' ' '+')
-            response=$(curl -e "$allanime_refr" -s -G "https://api.$allanime_base/api" --data-urlencode 'variables={"search":{"allowAdult":false,"allowUnknown":false,"query":"'"$query_title"'"},"limit":40,"page":1,"translationType":"sub","countryOrigin":"ALL"}' --data-urlencode 'query=query(        $search: SearchInput        $limit:Int        $page: Int        $translationType: VaildTranslationTypeEnumType        $countryOrigin: VaildCountryOriginEnumType    ) {    shows(        search: $search        limit: $limit        page: $page        translationType: $translationType        countryOrigin: $countryOrigin    ) {        edges {            _id name availableEpisodes __typename       }    }}' | sed 's|Show|\n|g' | sed -nE 's|.*_id":"([^"]*)","name":"([^"]*)".*sub":([1-9][^,]*).*|\1\t\2 (\3 episodes)|p')
+            search_gql='query( $search: SearchInput $limit: Int $page: Int $translationType: VaildTranslationTypeEnumType $countryOrigin: VaildCountryOriginEnumType ) { shows( search: $search limit: $limit page: $page translationType: $translationType countryOrigin: $countryOrigin ) { edges { _id name availableEpisodes __typename } }}'
+            response=$(curl -e "$allanime_refr" -s -H "Content-Type: application/json" -X POST "https://api.$allanime_base/api" --data "{\"variables\":{\"search\":{\"allowAdult\":false,\"allowUnknown\":false,\"query\":\"$query_title\"},\"limit\":40,\"page\":1,\"translationType\":\"sub\",\"countryOrigin\":\"ALL\"},\"query\":\"$search_gql\"}" | sed 's|Show|\n|g' | sed -nE 's|.*_id":"([^"]*)","name":"([^"]*)".*sub":([1-9][^,]*).*|\1\t\2 (\3 episodes)|p')
             [ -z "$response" ] && exit 1
             # if it is only one line long, then auto select it
             if [ "$(printf "%s\n" "$response" | wc -l)" -eq 1 ]; then
@@ -941,7 +958,12 @@ get_episode_info() {
 extract_from_json() {
     case "$provider" in
         allanime)
-            resp=$(printf "%s" "$json_data" | tr '{}' '\n' | sed 's|\\u002F|\/|g;s|\\||g' | sed -nE 's|.*sourceUrl":"--([^"]*)".*sourceName":"([^"]*)".*|\2 :\1|p')
+            if printf "%s" "$json_data" | grep -q '"tobeparsed"'; then
+                blob=$(printf "%s" "$json_data" | sed -nE 's|.*"tobeparsed":"([^"]*)".*|\1|p')
+                resp=$(decode_tobeparsed "$blob")
+            else
+                resp=$(printf "%s" "$json_data" | tr '{}' '\n' | sed 's|\\u002F|\/|g;s|\\||g' | sed -nE 's|.*sourceUrl":"--([^"]*)".*sourceName":"([^"]*)".*|\2 :\1|p')
+            fi
             # generate links into sequential files
             cache_dir="$(mktemp -d)"
             link_providers="1 2 3 4 5"
@@ -1039,7 +1061,8 @@ extract_from_json() {
 get_json() {
     case "$provider" in
         allanime)
-            json_data=$(curl -e "$allanime_refr" -s -G "https://api.$allanime_base/api" --data-urlencode 'variables={"showId":"'"$episode_id"'","translationType":"'"$translation_type"'","episodeString":"'"$episode_number"'"}' --data-urlencode 'query=query ($showId: String!, $translationType: VaildTranslationTypeEnumType!, $episodeString: String!) {    episode(        showId: $showId        translationType: $translationType        episodeString: $episodeString    ) {        episodeString sourceUrls    }}')
+            episode_embed_gql='query ($showId: String!, $translationType: VaildTranslationTypeEnumType!, $episodeString: String!) { episode( showId: $showId translationType: $translationType episodeString: $episodeString ) { episodeString sourceUrls }}'
+            json_data=$(curl -e "$allanime_refr" -s -H "Content-Type: application/json" -X POST "https://api.$allanime_base/api" --data "{\"variables\":{\"showId\":\"$episode_id\",\"translationType\":\"$translation_type\",\"episodeString\":\"$episode_number\"},\"query\":\"$episode_embed_gql\"}")
             ;;
         aniwatch)
             source_id=$(curl -s "https://hianime.to/ajax/v2/episode/servers?episodeId=$episode_id" |
